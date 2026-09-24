@@ -1,0 +1,57 @@
+import csv
+import sqlite3
+from pathlib import Path
+
+
+CASE_PACK_PATH = Path.home() / "Desktop" / "HHGOA_IEEE" / "case_pack.csv"
+TRANSACTIONS_DB_PATH = Path.home() / "Desktop" / "HHGOA_IEEE" / "transactions.db"
+
+
+def get_dashboard_stats():
+    # -----------------------------
+    # Investigation cases
+    # -----------------------------
+    active_investigations = 0
+
+    if CASE_PACK_PATH.exists():
+        with open(CASE_PACK_PATH, "r", newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            active_investigations = sum(1 for _ in reader)
+
+    # -----------------------------
+    # Transaction risk statistics
+    # -----------------------------
+    high_risk_transactions = 0
+    total_transactions = 0
+
+    if TRANSACTIONS_DB_PATH.exists():
+        conn = sqlite3.connect(TRANSACTIONS_DB_PATH)
+
+        total_transactions = conn.execute(
+            "SELECT COUNT(*) FROM transactions"
+        ).fetchone()[0]
+
+        high_risk_transactions = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM transactions
+            WHERE risk_score >= 0.85
+            """
+        ).fetchone()[0]
+
+        conn.close()
+
+    return {
+        "active_investigations": active_investigations,
+        "high_risk_transactions": high_risk_transactions,
+
+        # These lifecycle states are not currently stored
+        # in the available case-pack/database schema.
+        "cases_awaiting_evidence": 0,
+        "cases_awaiting_approval": 0,
+        "open_alerts": 0,
+        "resolved_cases": 0,
+
+        "total_transactions": total_transactions,
+        "status": "backend_connected",
+    }

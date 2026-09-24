@@ -1,0 +1,296 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.services.investigation_service import investigate_case
+from app.services.risk_engine import calculate_fraud_assessment
+from app.services.decision_engine import decide_next_action
+from app.services.investigation_state_service import (
+    save_evidence_request,
+    create_approval_request,
+)
+
+
+class EvidenceRequest(BaseModel):
+    type: str
+    reason: str
+    policy: str
+    requiredApproval: bool
+    expectedEvidence: str
+
+
+class ApprovalRequest(BaseModel):
+    action: str
+    reason: str
+    policy: str
+
+
+router = APIRouter(
+    prefix="/api/v1/investigations",
+    tags=["Investigations"],
+)
+
+
+@router.get("/{case_id}")
+def get_investigation(case_id: str):
+    evidence = investigate_case(case_id)
+
+    if not evidence:
+        raise HTTPException(
+            status_code=404,
+            detail="Investigation case not found",
+        )
+
+    assessment = calculate_fraud_assessment(evidence)
+
+    decision = decide_next_action(
+        evidence,
+        assessment,
+    )
+
+    case = evidence["case"]
+    transaction = evidence["transaction"]
+
+    risk_score = float(assessment.get("risk_score") or 0)
+    risk_score_100 = round(risk_score * 100)
+
+    if risk_score >= 0.85:
+        risk_level = "CRITICAL"
+    elif risk_score >= 0.60:
+        risk_level = "HIGH"
+    elif risk_score >= 0.30:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    confidence = risk_score_100
+
+    current_assessment = {
+        "riskLevel": risk_level,
+        "riskScore": risk_score_100,
+        "confidence": confidence,
+        "evidenceSufficiency": (
+            "SUFFICIENT"
+            if evidence["identity"] is not None
+            else "PARTIAL"
+        ),
+        "remainingUncertainty": (
+            "LOW"
+            if evidence["identity"] is not None
+            else "MEDIUM"
+        ),
+        "whyUncertaintyRemains": (
+            "Identity evidence is unavailable."
+            if evidence["identity"] is None
+            else "No major evidence gap identified."
+        ),
+        "evaluatedAt": case["opened_at"],
+    }
+
+    initial_assessment = {
+        **current_assessment,
+    }
+
+    ui_transaction = {
+        "id": str(transaction.get("transaction_id")),
+        "customerId": transaction.get("customer_id"),
+        "customerNameMasked": "Unknown",
+        "riskLevel": risk_level,
+        "riskScore": risk_score_100,
+        "amount": transaction.get("transaction_amt"),
+        "currency": "USD",
+        "timestamp": transaction.get("transaction_dt"),
+    }
+
+    timeline = [
+        {
+            "id": f"{case_id}-trigger",
+            "stage": "Trigger",
+            "timestamp": case["opened_at"],
+            "actor": "System",
+            "status": "COMPLETED",
+            "explanation": case["trigger_text"],
+        },
+        {
+            "id": f"{case_id}-case",
+            "stage": "Case Created",
+            "timestamp": case["opened_at"],
+            "actor": "System",
+            "status": "COMPLETED",
+            "explanation": (
+                "Investigation case created from the "
+                "transaction risk trigger."
+            ),
+        },
+        {
+            "id": f"{case_id}-investigation",
+            "stage": "Investigation Started",
+            "timestamp": case["opened_at"],
+            "actor": "FraudGraph Agent",
+            "status": "COMPLETED",
+            "explanation": (
+                "Transaction, customer, card and historical "
+                "evidence were gathered."
+            ),
+        },
+        {
+            "id": f"{case_id}-assessment",
+            "stage": "Fraud Pattern Assessment",
+            "timestamp": case["opened_at"],
+            "actor": "FraudGraph Agent",
+            "status": "COMPLETED",
+            "explanation": (
+                f"Risk assessment completed with a score of "
+                f"{risk_score_100}/100."
+            ),
+        },
+        {
+            "id": f"{case_id}-action",
+            "stage": "Action",
+            "timestamp": case["opened_at"],
+            "actor": "FraudGraph Agent",
+            "status": "COMPLETED",
+            "explanation": decision["reason"],
+        },
+    ]
+
+    ui_evidence = []
+
+    for item in assessment.get("evidence", []):
+        if isinstance(item, dict):
+            ui_evidence.append(item)
+        else:
+            ui_evidence.append(
+                {
+                    "id": (
+                        f"{case_id}-evidence-"
+                        f"{len(ui_evidence) + 1}"
+                    ),
+                    "category": "Risk Assessment",
+                    "description": str(item),
+                    "status": "AVAILABLE",
+                }
+            )
+
+    graph = {
+        "nodes": [],
+        "edges": [],
+    }
+
+    agent_steps = []
+
+    return {
+        "id": f"INV-{case_id}",
+        "caseId": case_id,
+        "title": f"Fraud Investigation {case_id}",
+        "triggerEvent": case["trigger_text"],
+        "status": "ACTIVE",
+        "assignedAnalyst": "Unassigned",
+        "createdAt": case["opened_at"],
+        "updatedAt": case["opened_at"],
+        "initialAssessment": initial_assessment,
+        "currentAssessment": current_assessment,
+        "hasAdditionalEvidenceRequested": bool(
+            decision.get("evidence_requests")
+        ),
+        "additionalEvidenceReceived": False,
+        "transaction": ui_transaction,
+        "timeline": timeline,
+        "evidence": ui_evidence,
+        "graph": graph,
+        "agentSteps": agent_steps,
+        "nextBestAction": decision,
+        "approvalRequest": None,
+        "fraudPatternMatched": (
+            evidence["historical_patterns"][0]
+            if evidence["historical_patterns"]
+            else None
+        ),
+        "rawEvidence": {
+            "customer_transactions": evidence[
+                "customer_transactions"
+            ],
+            "identity": evidence["identity"],
+            "customer_history": evidence["customer_history"],
+            "card_history": evidence["card_history"],
+            "historical_patterns": evidence[
+                "historical_patterns"
+            ],
+            "assessment": assessment,
+            "decision": decision,
+        },
+    }
+
+
+@router.post("/{case_id}/request-evidence")
+def request_additional_evidence(
+    case_id: str,
+    request: EvidenceRequest,
+):
+    evidence = investigate_case(case_id)
+
+    if not evidence:
+        raise HTTPException(
+            status_code=404,
+            detail="Investigation case not found",
+        )
+
+    evidence_ref_id = f"EV-{case_id}-05"
+
+    saved_request = save_evidence_request(
+        case_id=case_id,
+        evidence_ref_id=evidence_ref_id,
+        evidence_type=request.type,
+        reason=request.reason,
+        policy=request.policy,
+        required_approval=request.requiredApproval,
+        expected_evidence=request.expectedEvidence,
+    )
+
+    return {
+        "success": True,
+        "message": (
+            f"Dispatched evidence request for {request.type} "
+            f"under Policy: {request.policy}. "
+            "System awaiting external verification."
+        ),
+        "evidenceRefId": saved_request["evidenceRefId"],
+        "status": saved_request["status"],
+        "caseStatus": saved_request["caseStatus"],
+    }
+
+
+@router.post("/{case_id}/request-approval")
+def request_approval(
+    case_id: str,
+    request: ApprovalRequest,
+):
+    evidence = investigate_case(case_id)
+
+    if not evidence:
+        raise HTTPException(
+            status_code=404,
+            detail="Investigation case not found",
+        )
+
+    approval_ref_id = f"APR-{case_id}-01"
+
+    saved_request = create_approval_request(
+        case_id=case_id,
+        approval_ref_id=approval_ref_id,
+        action=request.action,
+        reason=request.reason,
+        policy=request.policy,
+    )
+
+    return {
+        "success": True,
+        "message": (
+            f"Approval requested for {request.action} "
+            f"under Policy: {request.policy}. "
+            "System awaiting analyst approval."
+        ),
+        "approvalRefId": saved_request["approvalRefId"],
+        "status": saved_request["status"],
+        "caseStatus": saved_request["caseStatus"],
+    }
+    
