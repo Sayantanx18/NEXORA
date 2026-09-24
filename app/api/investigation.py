@@ -80,29 +80,20 @@ def get_investigation(case_id: str):
 
     confidence = risk_score_100
 
-    # AI analysis is optional. Keep the API fast and reliable by
-    # using the local rule-based assessment for the investigation response.
-    ai_analysis = {
-        "summary": (
-            "Investigation completed using transaction, historical, "
-            "identity and graph evidence."
-        ),
-        "risk_assessment": risk_level,
-        "suspicious_indicators": assessment.get("evidence", []),
-        "historical_pattern_analysis": (
-            "Historical transaction patterns were analyzed by the backend."
-        ),
-        "reasoning": [
-            "Rule-based risk assessment completed.",
-            "Next-best-action decision engine completed.",
-            "TigerGraph relationship evidence was retrieved."
-        ],
-        "recommended_next_action": decision.get(
-            "next_best_actions",
-            ["REVIEW"],
-        ),
-        "confidence": confidence / 100,
-    }
+    # Generate real Gemini investigation analysis.
+    ai_analysis = analyze_fraud_case({
+        "case": evidence.get("case"),
+        "transaction": evidence.get("transaction"),
+        "customer_history": evidence.get("customer_history"),
+        "card_history": evidence.get("card_history"),
+        "customer_transactions": evidence.get("customer_transactions"),
+        "identity": evidence.get("identity"),
+        "historical_patterns": evidence.get("historical_patterns"),
+        "risk_assessment": assessment,
+        "next_best_action": decision,
+        "graph": evidence.get("tigergraph_graph"),
+    })
+        
 
     case = evidence["case"]
     transaction = evidence["transaction"]
