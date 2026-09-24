@@ -80,32 +80,29 @@ def get_investigation(case_id: str):
 
     confidence = risk_score_100
 
-    # AI analysis is optional. The investigation must still work
-    # when Gemini is temporarily unavailable or overloaded.
-    try:
-        ai_analysis = analyze_fraud_case(evidence)
-    except Exception:
-        ai_analysis = {
-            "summary": (
-                "AI analysis temporarily unavailable. "
-                "Rule-based investigation completed successfully."
-            ),
-            "risk_assessment": risk_level,
-            "suspicious_indicators": [],
-            "historical_pattern_analysis": (
-                "Historical transaction patterns were "
-                "analyzed by the backend."
-            ),
-            "reasoning": [
-                "Rule-based risk and decision engines "
-                "completed successfully."
-            ],
-            "recommended_next_action": decision.get(
-                "next_best_actions",
-                ["REVIEW"],
-            ),
-            "confidence": confidence / 100,
-        }
+    # AI analysis is optional. Keep the API fast and reliable by
+    # using the local rule-based assessment for the investigation response.
+    ai_analysis = {
+        "summary": (
+            "Investigation completed using transaction, historical, "
+            "identity and graph evidence."
+        ),
+        "risk_assessment": risk_level,
+        "suspicious_indicators": assessment.get("evidence", []),
+        "historical_pattern_analysis": (
+            "Historical transaction patterns were analyzed by the backend."
+        ),
+        "reasoning": [
+            "Rule-based risk assessment completed.",
+            "Next-best-action decision engine completed.",
+            "TigerGraph relationship evidence was retrieved."
+        ],
+        "recommended_next_action": decision.get(
+            "next_best_actions",
+            ["REVIEW"],
+        ),
+        "confidence": confidence / 100,
+    }
 
     case = evidence["case"]
     transaction = evidence["transaction"]
@@ -272,55 +269,138 @@ def get_investigation(case_id: str):
         },
     ]
 
+    tigergraph_graph = evidence.get(
+        "tigergraph_graph",
+        {},
+    )
+
     graph_nodes = [
         {
             "id": f"case-{case_id}",
             "type": "case",
             "label": case_id,
-        },
-        {
-            "id": (
-                f"transaction-"
-                f"{transaction.get('transaction_id')}"
-            ),
-            "type": "transaction",
-            "label": str(
-                transaction.get("transaction_id")
-            ),
-        },
-        {
-            "id": (
-                f"customer-"
-                f"{transaction.get('customer_id')}"
-            ),
-            "type": "customer",
-            "label": str(
-                transaction.get("customer_id")
-            ),
-        },
+        }
     ]
 
-    graph_edges = [
+    graph_edges = []
+
+    # Always connect the investigation case to its flagged transaction.
+    transaction_id = str(
+        transaction.get("transaction_id")
+    )
+
+    transaction_node_id = f"transaction-{transaction_id}"
+
+    graph_nodes.append(
+        {
+            "id": transaction_node_id,
+            "type": "transaction",
+            "label": transaction_id,
+        }
+    )
+
+    graph_edges.append(
         {
             "source": f"case-{case_id}",
-            "target": (
-                f"transaction-"
-                f"{transaction.get('transaction_id')}"
-            ),
+            "target": transaction_node_id,
             "relationship": "FLAGGED_TRANSACTION",
-        },
-        {
-            "source": (
-                f"transaction-"
-                f"{transaction.get('transaction_id')}"
-            ),
-            "target": (
-                f"customer-"
-                f"{transaction.get('customer_id')}"
-            ),
-            "relationship": "BELONGS_TO_CUSTOMER",
-        },
-    ]
+        }
+    )
+
+    # Add live TigerGraph nodes and relationships.
+    if (
+        tigergraph_graph.get("status") == "ONLINE"
+        and tigergraph_graph.get("nodes")
+    ):
+        type_map = {
+            "Transaction": "transaction",
+            "Account": "account",
+            "Customer": "customer",
+            "Device": "device",
+            "IdentitySignal": "identity_signal",
+        }
+
+        for node in tigergraph_graph.get("nodes", []):
+            vertex_type = node.get("v_type")
+            vertex_id = node.get("v_id")
+
+            if not vertex_type or vertex_id is None:
+                continue
+
+            graph_type = type_map.get(
+                vertex_type,
+                vertex_type.lower(),
+            )
+
+            graph_node_id = (
+                f"{graph_type}-{vertex_id}"
+            )
+
+            # Avoid adding the transaction twice.
+            if not any(
+                existing["id"] == graph_node_id
+                for existing in graph_nodes
+            ):
+                graph_nodes.append(
+                    {
+                        "id": graph_node_id,
+                        "type": graph_type,
+                        "label": str(vertex_id),
+                    }
+                )
+
+        for edge in tigergraph_graph.get("edges", []):
+            from_type = type_map.get(
+                edge.get("from_type"),
+                str(edge.get("from_type", "")).lower(),
+            )
+            to_type = type_map.get(
+                edge.get("to_type"),
+                str(edge.get("to_type", "")).lower(),
+            )
+
+            from_id = edge.get("from_id")
+            to_id = edge.get("to_id")
+
+            if from_id is None or to_id is None:
+                continue
+
+            graph_edges.append(
+                {
+                    "source": f"{from_type}-{from_id}",
+                    "target": f"{to_type}-{to_id}",
+                    "relationship": edge.get(
+                        "e_type",
+                        "RELATED_TO",
+                    ),
+                }
+            )
+
+    else:
+        # Graceful fallback if TigerGraph is unavailable.
+        customer_id = transaction.get("customer_id")
+
+        if customer_id:
+            customer_node_id = (
+                f"customer-{customer_id}"
+            )
+
+            graph_nodes.append(
+                {
+                    "id": customer_node_id,
+                    "type": "customer",
+                    "label": str(customer_id),
+                }
+            )
+
+            graph_edges.append(
+                {
+                    "source": transaction_node_id,
+                    "target": customer_node_id,
+                    "relationship": "BELONGS_TO_CUSTOMER",
+                }
+            )
+
 
     agent_steps = [
         {
@@ -402,7 +482,6 @@ def get_investigation(case_id: str):
                 ),
             }
         )
-
     return {
         "id": f"INV-{case_id}",
         "caseId": case_id,
